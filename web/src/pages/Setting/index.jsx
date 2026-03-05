@@ -49,6 +49,7 @@ import DrawingSetting from '../../components/settings/DrawingSetting';
 import PaymentSetting from '../../components/settings/PaymentSetting';
 import ModelDeploymentSetting from '../../components/settings/ModelDeploymentSetting';
 import PerformanceSetting from '../../components/settings/PerformanceSetting';
+import SystemKeySetting from '../../components/settings/SystemKeySetting';
 
 const Setting = () => {
   const { t } = useTranslation();
@@ -177,6 +178,16 @@ const Setting = () => {
       ),
       content: <OtherSetting />,
       itemKey: 'other',
+    });
+    panes.push({
+      tab: (
+        <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+          <Settings size={18} />
+          {t('系统 Key 管理')}
+        </span>
+      ),
+      content: <SystemKeySetting />,
+      itemKey: 'system-key',
     });
   }
   const onChangeTab = (key) => {

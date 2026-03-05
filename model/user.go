@@ -489,6 +489,13 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 			_ = inviteUser(inviterId)
 		}
 	}
+
+	// 自动为新用户创建默认 API Key
+	if err := CreateDefaultTokenForUser(user.Id); err != nil {
+		common.SysError(fmt.Sprintf("为新用户 %s 自动创建 API Key 失败: %s", user.Username, err.Error()))
+	} else {
+		common.SysLog(fmt.Sprintf("为新用户 %s 自动创建默认 API Key 成功", user.Username))
+	}
 }
 
 func (user *User) Update(updatePassword bool) error {
