@@ -254,6 +254,13 @@ func SetApiRouter(router *gin.Engine) {
 			tokenRoute.POST("/batch", controller.DeleteTokenBatch)
 		}
 
+		// 管理员 Token 管理路由
+		adminTokenRoute := apiRouter.Group("/admin/token")
+		adminTokenRoute.Use(middleware.AdminAuth())
+		{
+			adminTokenRoute.POST("/", controller.AdminAddToken)
+		}
+
 		usageRoute := apiRouter.Group("/usage")
 		usageRoute.Use(middleware.CORS(), middleware.CriticalRateLimit())
 		{
@@ -367,6 +374,29 @@ func SetApiRouter(router *gin.Engine) {
 			deploymentsRoute.PUT("/:id/name", controller.UpdateDeploymentName)
 			deploymentsRoute.POST("/:id/extend", controller.ExtendDeployment)
 			deploymentsRoute.DELETE("/:id", controller.DeleteDeployment)
+		}
+
+		// 系统 Key 管理（Root Only）
+		systemKeyRoute := apiRouter.Group("/system-key")
+		systemKeyRoute.Use(middleware.RootAuth())
+		{
+			systemKeyRoute.GET("/", controller.GetAllSystemKeys)
+			systemKeyRoute.POST("/", controller.CreateSystemKey)
+			systemKeyRoute.PUT("/:id", controller.UpdateSystemKey)
+			systemKeyRoute.DELETE("/:id", controller.DeleteSystemKey)
+			systemKeyRoute.GET("/logs", controller.GetSystemKeyLogs)
+			systemKeyRoute.GET("/:id/key", controller.GetSystemKeyFullKey)
+		}
+
+		// 第三方 API（SystemKeyAuth）
+		externalRoute := apiRouter.Group("/external")
+		externalRoute.Use(middleware.SystemKeyAuth())
+		{
+			externalRoute.GET("/user", controller.ExtGetUserInfo)
+			externalRoute.GET("/user/tokens", controller.ExtGetUserTokens)
+			externalRoute.GET("/user/models", controller.ExtGetUserModels)
+			externalRoute.POST("/user/tokens", controller.ExtCreateToken)
+			externalRoute.DELETE("/user/tokens/:token_id", controller.ExtDeleteToken)
 		}
 	}
 }

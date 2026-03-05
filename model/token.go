@@ -460,3 +460,34 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 
 	return len(tokens), nil
 }
+
+// CreateDefaultTokenForUser 为指定用户创建一个默认的 API Key。
+// 如果用户已有 Token 则跳过创建。
+func CreateDefaultTokenForUser(userId int) error {
+	// 检查用户是否已有 Token
+	count, err := CountUserTokens(userId)
+	if err != nil {
+		return fmt.Errorf("检查用户 Token 数量失败: %w", err)
+	}
+	if count > 0 {
+		return nil // 已有 Token，无需创建
+	}
+
+	// 生成 Key
+	key, err := common.GenerateKey()
+	if err != nil {
+		return fmt.Errorf("生成 API Key 失败: %w", err)
+	}
+
+	// 创建默认 Token
+	token := &Token{
+		UserId:         userId,
+		Name:           "默认令牌",
+		Key:            key,
+		CreatedTime:    common.GetTimestamp(),
+		AccessedTime:   common.GetTimestamp(),
+		ExpiredTime:    -1, // 永不过期
+		UnlimitedQuota: true,
+	}
+	return token.Insert()
+}
