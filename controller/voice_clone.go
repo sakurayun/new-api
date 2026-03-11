@@ -385,6 +385,14 @@ func VoiceClone(c *gin.Context) {
 		})
 	}
 
+	// 克隆成功后，将用户音色映射保存到数据库
+	if upstreamSuccess {
+		cleanVoiceId := stripVoiceIdPrefix(req.VoiceId, userId)
+		if saveErr := model.SaveUserVoice(userId, cleanVoiceId, "cloning", ""); saveErr != nil {
+			common.SysLog(fmt.Sprintf("保存用户音色映射失败: user=%d, voice=%s, err=%v", userId, cleanVoiceId, saveErr))
+		}
+	}
+
 	c.Data(resp.StatusCode, "application/json", respBody)
 }
 
@@ -460,23 +468,24 @@ func GetVoice(c *gin.Context) {
 		return
 	}
 
-	// 过滤 voice_cloning：只保留属于当前用户的（带用户前缀的）
-	// 注意：保留完整的带前缀 voice_id，用户可直接在 TTS 调用中使用
+	// 过滤 voice_cloning：只保留属于当前用户的（带用户前缀的），并去除前缀
 	if len(voiceResp.VoiceCloning) > 0 {
 		filtered := make([]minimax.VoiceCloningInfo, 0)
 		for _, v := range voiceResp.VoiceCloning {
 			if hasVoiceIdPrefix(v.VoiceId, userId) {
+				v.VoiceId = stripVoiceIdPrefix(v.VoiceId, userId)
 				filtered = append(filtered, v)
 			}
 		}
 		voiceResp.VoiceCloning = filtered
 	}
 
-	// 过滤 voice_generation：同样做用户级过滤
+	// 过滤 voice_generation：同样做用户级过滤，并去除前缀
 	if len(voiceResp.VoiceGeneration) > 0 {
 		filtered := make([]minimax.VoiceGenerationInfo, 0)
 		for _, v := range voiceResp.VoiceGeneration {
 			if hasVoiceIdPrefix(v.VoiceId, userId) {
+				v.VoiceId = stripVoiceIdPrefix(v.VoiceId, userId)
 				filtered = append(filtered, v)
 			}
 		}
@@ -484,6 +493,26 @@ func GetVoice(c *gin.Context) {
 	}
 
 	// system_voice 对所有用户可见，不过滤
+	// 异步同步系统音色到数据库，用于 TTS 调用时判断是否为系统音色
+	if len(voiceResp.SystemVoice) > 0 {
+		go func() {
+			voices := make([]model.MiniMaxVoice, 0, len(voiceResp.SystemVoice))
+			for _, sv := range voiceResp.SystemVoice {
+				desc := ""
+				if len(sv.Description) > 0 {
+					desc = strings.Join(sv.Description, "; ")
+				}
+				voices = append(voices, model.MiniMaxVoice{
+					VoiceId:   sv.VoiceId,
+					VoiceName: sv.VoiceName,
+					Description: desc,
+				})
+			}
+			if err := model.UpsertSystemVoices(voices); err != nil {
+				common.SysLog("failed to sync system voices: " + err.Error())
+			}
+		}()
+	}
 
 	c.JSON(http.StatusOK, voiceResp)
 }
@@ -568,6 +597,13 @@ func DeleteVoice(c *gin.Context) {
 	// 去除返回中的用户前缀
 	deleteResp.VoiceId = stripVoiceIdPrefix(deleteResp.VoiceId, userId)
 
+	// 删除成功后，从数据库中移除用户音色映射
+	if deleteResp.BaseResp.StatusCode == 0 {
+		if delErr := model.DeleteUserVoice(userId, deleteResp.VoiceId); delErr != nil {
+			common.SysLog(fmt.Sprintf("删除用户音色映射失败: user=%d, voice=%s, err=%v", userId, deleteResp.VoiceId, delErr))
+		}
+	}
+
 	c.JSON(http.StatusOK, deleteResp)
 }
 
@@ -606,9 +642,15 @@ func T2AAsync(c *gin.Context) {
 	// 提取 model 名称
 	modelName, _ := reqMap["model"].(string)
 
-	// 注意：不再自动给 voice_id 加用户前缀
-	// 用户克隆的音色在 GetVoice 返回时已包含完整的带前缀 voice_id，可直接使用
-	// 系统音色不需要前缀，直接透传即可
+	// 智能前缀处理：通过数据库判断是否为系统音色
+	// 系统音色不加前缀，用户克隆音色加用户前缀
+	if voiceSetting, ok := reqMap["voice_setting"].(map[string]interface{}); ok {
+		if voiceId, ok := voiceSetting["voice_id"].(string); ok && voiceId != "" {
+			if !model.IsSystemVoice(voiceId) {
+				voiceSetting["voice_id"] = addVoiceIdPrefix(voiceId, userId)
+			}
+		}
+	}
 
 	// 重新序列化请求体
 	jsonData, err := common.Marshal(reqMap)
@@ -785,9 +827,28 @@ func T2ASync(c *gin.Context) {
 	modelName, _ := reqMap["model"].(string)
 	isStream, _ := reqMap["stream"].(bool)
 
-	// 注意：不再自动给 voice_id 加用户前缀
-	// 用户克隆的音色在 GetVoice 返回时已包含完整的带前缀 voice_id，可直接使用
-	// 系统音色不需要前缀，直接透传即可
+	// 智能前缀处理：通过数据库判断是否为系统音色
+	// 系统音色不加前缀，用户克隆音色加用户前缀
+	if voiceSetting, ok := reqMap["voice_setting"].(map[string]interface{}); ok {
+		if voiceId, ok := voiceSetting["voice_id"].(string); ok && voiceId != "" {
+			if !model.IsSystemVoice(voiceId) {
+				voiceSetting["voice_id"] = addVoiceIdPrefix(voiceId, userId)
+			}
+		}
+	}
+
+	// 对 timbre_weights 中的 voice_id 也做智能前缀处理
+	if timbreWeights, ok := reqMap["timbre_weights"].([]interface{}); ok {
+		for _, tw := range timbreWeights {
+			if twMap, ok := tw.(map[string]interface{}); ok {
+				if voiceId, ok := twMap["voice_id"].(string); ok && voiceId != "" {
+					if !model.IsSystemVoice(voiceId) {
+						twMap["voice_id"] = addVoiceIdPrefix(voiceId, userId)
+					}
+				}
+			}
+		}
+	}
 
 	// 重新序列化请求体
 	jsonData, err := common.Marshal(reqMap)
