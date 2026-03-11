@@ -398,7 +398,8 @@ func VoiceClone(c *gin.Context) {
 
 
 // GetVoice 处理 POST /v1/get_voice
-// 查询可用音色，过滤只返回当前用户的复刻音色
+// 从数据库读取系统音色列表 + 当前用户的克隆音色列表
+// 如果数据库中没有系统音色数据，则先调用上游同步
 func GetVoice(c *gin.Context) {
 	userId := c.GetInt("id")
 	if userId == 0 {
@@ -406,36 +407,86 @@ func GetVoice(c *gin.Context) {
 		return
 	}
 
-	chInfo, err := getMiniMaxChannelConfig(c)
+	// 如果数据库中没有系统音色，先触发一次上游同步
+	if !model.HasSystemVoices() {
+		chInfo, err := getMiniMaxChannelConfig(c)
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		if syncErr := syncSystemVoicesFromUpstream(chInfo); syncErr != nil {
+			common.SysLog("首次同步系统音色失败: " + syncErr.Error())
+			// 同步失败也继续尝试从 DB 读取，可能之前部分成功了
+		}
+	} else {
+		// 数据库中已有系统音色，异步刷新（不阻塞响应）
+		go func() {
+			chInfo, err := getMiniMaxChannelConfig(c.Copy())
+			if err != nil {
+				return
+			}
+			_ = syncSystemVoicesFromUpstream(chInfo)
+		}()
+	}
+
+	// 从数据库读取系统音色
+	systemVoices := model.GetSystemVoicesFromDB()
+	systemVoiceInfos := make([]minimax.SystemVoiceInfo, 0, len(systemVoices))
+	for _, v := range systemVoices {
+		info := minimax.SystemVoiceInfo{
+			VoiceId:   v.VoiceId,
+			VoiceName: v.VoiceName,
+		}
+		if v.Description != "" {
+			info.Description = strings.Split(v.Description, "; ")
+		}
+		systemVoiceInfos = append(systemVoiceInfos, info)
+	}
+
+	// 从数据库读取当前用户的克隆音色
+	userVoices := model.GetUserVoicesFromDB(userId)
+	cloningInfos := make([]minimax.VoiceCloningInfo, 0)
+	generationInfos := make([]minimax.VoiceGenerationInfo, 0)
+	for _, v := range userVoices {
+		switch v.VoiceType {
+		case "cloning":
+			cloningInfos = append(cloningInfos, minimax.VoiceCloningInfo{
+				VoiceId: v.VoiceId,
+			})
+		case "generation":
+			generationInfos = append(generationInfos, minimax.VoiceGenerationInfo{
+				VoiceId: v.VoiceId,
+			})
+		}
+	}
+
+	// 构造响应
+	voiceResp := minimax.GetVoiceResponse{
+		SystemVoice:     systemVoiceInfos,
+		VoiceCloning:    cloningInfos,
+		VoiceGeneration: generationInfos,
+		BaseResp: minimax.MiniMaxBaseResp{
+			StatusCode: 0,
+			StatusMsg:  "success",
+		},
+	}
+
+	c.JSON(http.StatusOK, voiceResp)
+}
+
+// syncSystemVoicesFromUpstream 从上游 Minimax 同步系统音色到数据库
+func syncSystemVoicesFromUpstream(chInfo *miniMaxChannelInfo) error {
+	// 构造请求（查询所有类型的音色）
+	reqBody := minimax.GetVoiceRequest{VoiceType: "all"}
+	jsonData, err := common.Marshal(reqBody)
 	if err != nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 解析请求体
-	var req minimax.GetVoiceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("请求体解析失败: %s", err.Error())})
-		return
-	}
-
-	if req.VoiceType == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "voice_type 为必填参数"})
-		return
-	}
-
-	// 序列化请求并转发到上游
-	jsonData, err := common.Marshal(req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化请求失败"})
-		return
+		return fmt.Errorf("序列化请求失败: %w", err)
 	}
 
 	upstreamUrl := fmt.Sprintf("%s/v1/get_voice", chInfo.BaseUrl)
 	httpReq, err := http.NewRequest("POST", upstreamUrl, bytes.NewReader(jsonData))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
-		return
+		return fmt.Errorf("创建请求失败: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+chInfo.ApiKey)
@@ -443,79 +494,47 @@ func GetVoice(c *gin.Context) {
 	client := service.GetHttpClient()
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("上游请求失败: %s", err.Error())})
-		return
+		return fmt.Errorf("上游请求失败: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取上游响应失败"})
-		return
+		return fmt.Errorf("读取上游响应失败: %w", err)
 	}
 
-	// 如果上游返回非 200，直接原样返回
 	if resp.StatusCode != http.StatusOK {
-		c.Data(resp.StatusCode, "application/json", respBody)
-		return
+		return fmt.Errorf("上游返回非 200: %d", resp.StatusCode)
 	}
 
-	// 解析上游响应，过滤用户音色
 	var voiceResp minimax.GetVoiceResponse
 	if err := common.Unmarshal(respBody, &voiceResp); err != nil {
-		// 解析失败时原样返回
-		c.Data(resp.StatusCode, "application/json", respBody)
-		return
+		return fmt.Errorf("解析上游响应失败: %w", err)
 	}
 
-	// 过滤 voice_cloning：只保留属于当前用户的（带用户前缀的），并去除前缀
-	if len(voiceResp.VoiceCloning) > 0 {
-		filtered := make([]minimax.VoiceCloningInfo, 0)
-		for _, v := range voiceResp.VoiceCloning {
-			if hasVoiceIdPrefix(v.VoiceId, userId) {
-				v.VoiceId = stripVoiceIdPrefix(v.VoiceId, userId)
-				filtered = append(filtered, v)
-			}
-		}
-		voiceResp.VoiceCloning = filtered
-	}
-
-	// 过滤 voice_generation：同样做用户级过滤，并去除前缀
-	if len(voiceResp.VoiceGeneration) > 0 {
-		filtered := make([]minimax.VoiceGenerationInfo, 0)
-		for _, v := range voiceResp.VoiceGeneration {
-			if hasVoiceIdPrefix(v.VoiceId, userId) {
-				v.VoiceId = stripVoiceIdPrefix(v.VoiceId, userId)
-				filtered = append(filtered, v)
-			}
-		}
-		voiceResp.VoiceGeneration = filtered
-	}
-
-	// system_voice 对所有用户可见，不过滤
-	// 异步同步系统音色到数据库，用于 TTS 调用时判断是否为系统音色
+	// 同步系统音色到数据库
 	if len(voiceResp.SystemVoice) > 0 {
-		go func() {
-			voices := make([]model.MiniMaxVoice, 0, len(voiceResp.SystemVoice))
-			for _, sv := range voiceResp.SystemVoice {
-				desc := ""
-				if len(sv.Description) > 0 {
-					desc = strings.Join(sv.Description, "; ")
-				}
-				voices = append(voices, model.MiniMaxVoice{
-					VoiceId:   sv.VoiceId,
-					VoiceName: sv.VoiceName,
-					Description: desc,
-				})
+		voices := make([]model.MiniMaxVoice, 0, len(voiceResp.SystemVoice))
+		for _, sv := range voiceResp.SystemVoice {
+			desc := ""
+			if len(sv.Description) > 0 {
+				desc = strings.Join(sv.Description, "; ")
 			}
-			if err := model.UpsertSystemVoices(voices); err != nil {
-				common.SysLog("failed to sync system voices: " + err.Error())
-			}
-		}()
+			voices = append(voices, model.MiniMaxVoice{
+				VoiceId:     sv.VoiceId,
+				VoiceName:   sv.VoiceName,
+				Description: desc,
+			})
+		}
+		if err := model.UpsertSystemVoices(voices); err != nil {
+			return fmt.Errorf("同步系统音色失败: %w", err)
+		}
+		common.SysLog(fmt.Sprintf("成功同步 %d 个系统音色到数据库", len(voices)))
 	}
 
-	c.JSON(http.StatusOK, voiceResp)
+	return nil
 }
+
 
 // DeleteVoice 处理 POST /v1/delete_voice
 // 删除音色，自动添加用户前缀确保只删除自己的

@@ -88,3 +88,24 @@ func GetUserVoiceIds(userId int) []string {
 	DB.Model(&MiniMaxVoice{}).Where("user_id = ?", userId).Pluck("voice_id", &voiceIds)
 	return voiceIds
 }
+
+// GetSystemVoicesFromDB 从数据库获取所有系统音色
+func GetSystemVoicesFromDB() []MiniMaxVoice {
+	var voices []MiniMaxVoice
+	DB.Where("user_id = 0 AND voice_type = 'system'").Find(&voices)
+	return voices
+}
+
+// GetUserVoicesFromDB 从数据库获取指定用户的克隆/生成音色
+func GetUserVoicesFromDB(userId int) []MiniMaxVoice {
+	var voices []MiniMaxVoice
+	DB.Where("user_id = ?", userId).Find(&voices)
+	return voices
+}
+
+// HasSystemVoices 判断数据库中是否已有系统音色数据
+func HasSystemVoices() bool {
+	var count int64
+	DB.Model(&MiniMaxVoice{}).Where("user_id = 0 AND voice_type = 'system'").Count(&count)
+	return count > 0
+}
