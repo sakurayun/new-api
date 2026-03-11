@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -754,4 +755,230 @@ func T2AAsyncQuery(c *gin.Context) {
 	}
 
 	c.Data(resp.StatusCode, "application/json", respBody)
+}
+
+// ========== 原生同步 TTS ==========
+
+// T2ASync 处理 POST /v1/t2a_v2
+// Minimax 原生同步语音合成接口，支持非流式和流式（SSE）模式
+// 计费逻辑：根据上游返回的 usage_characters 计费
+func T2ASync(c *gin.Context) {
+	userId := c.GetInt("id")
+	if userId == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "未授权"})
+		return
+	}
+
+	chInfo, err := getMiniMaxChannelConfig(c)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 读取原始请求体
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求体失败"})
+		return
+	}
+	defer c.Request.Body.Close()
+
+	// 解析请求以获取 model、stream 和 voice_id
+	var reqMap map[string]interface{}
+	if err := common.Unmarshal(bodyBytes, &reqMap); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请求体 JSON 格式无效"})
+		return
+	}
+
+	modelName, _ := reqMap["model"].(string)
+	isStream, _ := reqMap["stream"].(bool)
+
+	// 对复刻音色的 voice_id 做用户前缀处理
+	if voiceSetting, ok := reqMap["voice_setting"].(map[string]interface{}); ok {
+		if voiceId, ok := voiceSetting["voice_id"].(string); ok && voiceId != "" {
+			voiceSetting["voice_id"] = addVoiceIdPrefix(voiceId, userId)
+		}
+	}
+
+	// 对 timbre_weights 中的 voice_id 也做前缀处理
+	if timbreWeights, ok := reqMap["timbre_weights"].([]interface{}); ok {
+		for _, tw := range timbreWeights {
+			if twMap, ok := tw.(map[string]interface{}); ok {
+				if voiceId, ok := twMap["voice_id"].(string); ok && voiceId != "" {
+					twMap["voice_id"] = addVoiceIdPrefix(voiceId, userId)
+				}
+			}
+		}
+	}
+
+	// 重新序列化请求体
+	jsonData, err := common.Marshal(reqMap)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化请求失败"})
+		return
+	}
+
+	startTime := time.Now()
+
+	// 转发请求到上游
+	upstreamUrl := fmt.Sprintf("%s/v1/t2a_v2", chInfo.BaseUrl)
+	httpReq, err := http.NewRequest("POST", upstreamUrl, bytes.NewReader(jsonData))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+chInfo.ApiKey)
+
+	client := service.GetHttpClient()
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("上游请求失败: %s", err.Error())})
+		return
+	}
+	defer resp.Body.Close()
+
+	if isStream {
+		// 流式模式：SSE 透传 + 在最后一个 chunk 中提取 usage_characters 计费
+		t2aSyncHandleStream(c, resp, chInfo, modelName, userId, startTime)
+	} else {
+		// 非流式模式：读取完整响应 → 计费 → 返回
+		t2aSyncHandleNonStream(c, resp, chInfo, modelName, userId, startTime)
+	}
+}
+
+// t2aSyncHandleNonStream 处理非流式同步 TTS 响应
+func t2aSyncHandleNonStream(c *gin.Context, resp *http.Response, chInfo *miniMaxChannelInfo, modelName string, userId int, startTime time.Time) {
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取上游响应失败"})
+		return
+	}
+
+	// 如果上游返回成功，解析 usage_characters 做计费
+	if resp.StatusCode == http.StatusOK && modelName != "" {
+		var ttsResp struct {
+			ExtraInfo struct {
+				UsageCharacters int `json:"usage_characters"`
+			} `json:"extra_info"`
+			BaseResp struct {
+				StatusCode int `json:"status_code"`
+			} `json:"base_resp"`
+		}
+		if parseErr := common.Unmarshal(respBody, &ttsResp); parseErr == nil && ttsResp.BaseResp.StatusCode == 0 {
+			t2aSyncDoBilling(c, chInfo, modelName, userId, ttsResp.ExtraInfo.UsageCharacters, startTime, false)
+		}
+	}
+
+	c.Data(resp.StatusCode, "application/json", respBody)
+}
+
+// t2aSyncHandleStream 处理流式（SSE）同步 TTS 响应
+func t2aSyncHandleStream(c *gin.Context, resp *http.Response, chInfo *miniMaxChannelInfo, modelName string, userId int, startTime time.Time) {
+	// 设置 SSE 响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(resp.StatusCode)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "不支持流式输出"})
+		return
+	}
+
+	var usageCharacters int
+	scanner := bufio.NewScanner(resp.Body)
+	// 增大缓冲区以处理大的音频 hex 数据行
+	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// 原样转发每一行到客户端
+		fmt.Fprintf(c.Writer, "%s\n", line)
+		flusher.Flush()
+
+		// 尝试从 SSE data 行中解析 usage_characters
+		if strings.HasPrefix(line, "data:") {
+			jsonStr := strings.TrimPrefix(line, "data:")
+			jsonStr = strings.TrimSpace(jsonStr)
+			if jsonStr == "" || jsonStr == "[DONE]" {
+				continue
+			}
+			var chunkResp struct {
+				Data struct {
+					Status int `json:"status"`
+				} `json:"data"`
+				ExtraInfo struct {
+					UsageCharacters int `json:"usage_characters"`
+				} `json:"extra_info"`
+				BaseResp struct {
+					StatusCode int `json:"status_code"`
+				} `json:"base_resp"`
+			}
+			if parseErr := common.Unmarshal([]byte(jsonStr), &chunkResp); parseErr == nil {
+				// status=2 表示最后一个 chunk，包含 extra_info
+				if chunkResp.Data.Status == 2 && chunkResp.BaseResp.StatusCode == 0 {
+					usageCharacters = chunkResp.ExtraInfo.UsageCharacters
+				}
+			}
+		}
+	}
+
+	// 流式结束后执行计费
+	if modelName != "" && usageCharacters > 0 {
+		t2aSyncDoBilling(c, chInfo, modelName, userId, usageCharacters, startTime, true)
+	}
+}
+
+// t2aSyncDoBilling 同步 TTS 计费逻辑（非流式/流式共用）
+func t2aSyncDoBilling(c *gin.Context, chInfo *miniMaxChannelInfo, modelName string, userId int, usageChars int, startTime time.Time, isStream bool) {
+	if usageChars <= 0 {
+		return
+	}
+
+	modelRatio, _, _ := ratio_setting.GetModelRatio(modelName)
+	groupRatio := ratio_setting.GetGroupRatio("default")
+	quota := int(float64(usageChars) * modelRatio * groupRatio)
+
+	if quota <= 0 {
+		return
+	}
+
+	useTimeSeconds := int(time.Now().Unix() - startTime.Unix())
+	tokenName := c.GetString("token_name")
+	tokenId := c.GetInt("token_id")
+
+	// 扣减用户额度
+	model.UpdateUserUsedQuotaAndRequestCount(userId, quota)
+	model.UpdateChannelUsedQuota(chInfo.ChannelId, quota)
+
+	// 记录消费日志
+	other := map[string]interface{}{
+		"model_ratio":      modelRatio,
+		"group_ratio":      groupRatio,
+		"sync_tts":         true,
+		"usage_characters": usageChars,
+	}
+
+	streamLabel := "同步"
+	if isStream {
+		streamLabel = "流式"
+	}
+
+	model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
+		ChannelId:        chInfo.ChannelId,
+		PromptTokens:     usageChars,
+		CompletionTokens: 0,
+		ModelName:        modelName,
+		TokenName:        tokenName,
+		Quota:            quota,
+		Content:          fmt.Sprintf("原生%s TTS，计费字符数 %d", streamLabel, usageChars),
+		TokenId:          tokenId,
+		UseTimeSeconds:   useTimeSeconds,
+		IsStream:         isStream,
+		Other:            other,
+	})
 }

@@ -172,6 +172,7 @@ func SetRelayRouter(router *gin.Engine) {
 		voiceCloneRouter.POST("/voice_clone", controller.VoiceClone)
 		voiceCloneRouter.POST("/get_voice", controller.GetVoice)
 		voiceCloneRouter.POST("/delete_voice", controller.DeleteVoice)
+		voiceCloneRouter.POST("/t2a_v2", controller.T2ASync)
 		voiceCloneRouter.POST("/t2a_async_v2", controller.T2AAsync)
 		voiceCloneRouter.GET("/query/t2a_async_query_v2", controller.T2AAsyncQuery)
 	}
