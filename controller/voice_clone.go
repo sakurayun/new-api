@@ -460,12 +460,12 @@ func GetVoice(c *gin.Context) {
 		return
 	}
 
-	// 过滤 voice_cloning：只保留属于当前用户的（带用户前缀的），并去除前缀
+	// 过滤 voice_cloning：只保留属于当前用户的（带用户前缀的）
+	// 注意：保留完整的带前缀 voice_id，用户可直接在 TTS 调用中使用
 	if len(voiceResp.VoiceCloning) > 0 {
 		filtered := make([]minimax.VoiceCloningInfo, 0)
 		for _, v := range voiceResp.VoiceCloning {
 			if hasVoiceIdPrefix(v.VoiceId, userId) {
-				v.VoiceId = stripVoiceIdPrefix(v.VoiceId, userId)
 				filtered = append(filtered, v)
 			}
 		}
@@ -477,7 +477,6 @@ func GetVoice(c *gin.Context) {
 		filtered := make([]minimax.VoiceGenerationInfo, 0)
 		for _, v := range voiceResp.VoiceGeneration {
 			if hasVoiceIdPrefix(v.VoiceId, userId) {
-				v.VoiceId = stripVoiceIdPrefix(v.VoiceId, userId)
 				filtered = append(filtered, v)
 			}
 		}
@@ -607,16 +606,9 @@ func T2AAsync(c *gin.Context) {
 	// 提取 model 名称
 	modelName, _ := reqMap["model"].(string)
 
-	// 对复刻音色的 voice_id 做用户前缀处理
-	if voiceSetting, ok := reqMap["voice_setting"].(map[string]interface{}); ok {
-		if voiceId, ok := voiceSetting["voice_id"].(string); ok && voiceId != "" {
-			// 判断是否为用户复刻音色（非系统音色），给其加上用户前缀
-			// 系统音色通常有固定格式（如 male-qn-*, female-*, audiobook_* 等）
-			// 这里统一加前缀，如果上游不认识会报错，用户可以自行去掉
-			// 注意：如果用户已经在查询音色时看到的是去前缀后的 ID，这里需要加回来
-			voiceSetting["voice_id"] = addVoiceIdPrefix(voiceId, userId)
-		}
-	}
+	// 注意：不再自动给 voice_id 加用户前缀
+	// 用户克隆的音色在 GetVoice 返回时已包含完整的带前缀 voice_id，可直接使用
+	// 系统音色不需要前缀，直接透传即可
 
 	// 重新序列化请求体
 	jsonData, err := common.Marshal(reqMap)
@@ -793,23 +785,9 @@ func T2ASync(c *gin.Context) {
 	modelName, _ := reqMap["model"].(string)
 	isStream, _ := reqMap["stream"].(bool)
 
-	// 对复刻音色的 voice_id 做用户前缀处理
-	if voiceSetting, ok := reqMap["voice_setting"].(map[string]interface{}); ok {
-		if voiceId, ok := voiceSetting["voice_id"].(string); ok && voiceId != "" {
-			voiceSetting["voice_id"] = addVoiceIdPrefix(voiceId, userId)
-		}
-	}
-
-	// 对 timbre_weights 中的 voice_id 也做前缀处理
-	if timbreWeights, ok := reqMap["timbre_weights"].([]interface{}); ok {
-		for _, tw := range timbreWeights {
-			if twMap, ok := tw.(map[string]interface{}); ok {
-				if voiceId, ok := twMap["voice_id"].(string); ok && voiceId != "" {
-					twMap["voice_id"] = addVoiceIdPrefix(voiceId, userId)
-				}
-			}
-		}
-	}
+	// 注意：不再自动给 voice_id 加用户前缀
+	// 用户克隆的音色在 GetVoice 返回时已包含完整的带前缀 voice_id，可直接使用
+	// 系统音色不需要前缀，直接透传即可
 
 	// 重新序列化请求体
 	jsonData, err := common.Marshal(reqMap)
