@@ -74,21 +74,28 @@ func getMiniMaxChannelConfig(c *gin.Context) (*miniMaxChannelInfo, error) {
 	}
 
 	// 从数据库查找可用的 Minimax 渠道
+	// 注意：GetChannelsByType 使用了 Omit("key") 不返回 key 字段，
+	// 所以找到 enabled 渠道后需要用 GetChannelById(selectAll=true) 重新查询以获取 key
 	channels, dbErr := model.GetChannelsByType(0, 10, false, constant.ChannelTypeMiniMax)
 	if dbErr != nil {
 		return nil, fmt.Errorf("查找 Minimax 渠道失败: %w", dbErr)
 	}
 	for _, ch := range channels {
 		if ch.Status == common.ChannelStatusEnabled {
-			baseUrl := ch.GetBaseURL()
+			// 重新查询完整渠道信息（含 key）
+			fullChannel, err := model.GetChannelById(ch.Id, true)
+			if err != nil {
+				continue
+			}
+			baseUrl := fullChannel.GetBaseURL()
 			if baseUrl == "" {
 				baseUrl = constant.ChannelBaseURLs[constant.ChannelTypeMiniMax]
 			}
-			key, _, keyErr := ch.GetNextEnabledKey()
+			key, _, keyErr := fullChannel.GetNextEnabledKey()
 			if keyErr != nil {
 				continue
 			}
-			return &miniMaxChannelInfo{BaseUrl: baseUrl, ApiKey: key, ChannelId: ch.Id}, nil
+			return &miniMaxChannelInfo{BaseUrl: baseUrl, ApiKey: key, ChannelId: fullChannel.Id}, nil
 		}
 	}
 	return nil, fmt.Errorf("未找到可用的 Minimax 渠道，请在管理后台添加 MiniMax 类型渠道")
