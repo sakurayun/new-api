@@ -165,6 +165,17 @@ func SetRelayRouter(router *gin.Engine) {
 		httpRouter.DELETE("/models/:model", controller.RelayNotImplemented)
 	}
 
+	// Minimax 音色复刻 / 异步 TTS 路由（不走 Distribute 中间件，因为不包含 model 字段）
+	voiceCloneRouter := relayV1Router.Group("")
+	{
+		voiceCloneRouter.POST("/files/upload", controller.VoiceCloneFileUpload)
+		voiceCloneRouter.POST("/voice_clone", controller.VoiceClone)
+		voiceCloneRouter.POST("/get_voice", controller.GetVoice)
+		voiceCloneRouter.POST("/delete_voice", controller.DeleteVoice)
+		voiceCloneRouter.POST("/t2a_async_v2", controller.T2AAsync)
+		voiceCloneRouter.GET("/query/t2a_async_query_v2", controller.T2AAsyncQuery)
+	}
+
 	relayMjRouter := router.Group("/mj")
 	relayMjRouter.Use(middleware.RouteTag("relay"))
 	relayMjRouter.Use(middleware.SystemPerformanceCheck())

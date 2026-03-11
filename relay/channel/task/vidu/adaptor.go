@@ -26,31 +26,93 @@ import (
 // Request / Response structures
 // ============================
 
+// subjectItem 参考生视频（主体调用）中的主体信息
+type subjectItem struct {
+	ID      string   `json:"id"`
+	Images  []string `json:"images"`
+	VoiceID string   `json:"voice_id,omitempty"`
+}
+
+// imageSettingItem 智能多帧中的关键帧配置
+type imageSettingItem struct {
+	Prompt   string `json:"prompt,omitempty"`
+	KeyImage string `json:"key_image"`
+	Duration int    `json:"duration,omitempty"`
+}
+
 type requestPayload struct {
+	// 通用字段
 	Model             string   `json:"model"`
-	Images            []string `json:"images"`
+	Images            []string `json:"images,omitempty"`
 	Prompt            string   `json:"prompt,omitempty"`
 	Duration          int      `json:"duration,omitempty"`
 	Seed              int      `json:"seed,omitempty"`
 	Resolution        string   `json:"resolution,omitempty"`
 	MovementAmplitude string   `json:"movement_amplitude,omitempty"`
-	Bgm               bool     `json:"bgm,omitempty"`
+	AspectRatio       string   `json:"aspect_ratio,omitempty"`
+	Bgm               *bool    `json:"bgm,omitempty"`
 	Payload           string   `json:"payload,omitempty"`
 	CallbackUrl       string   `json:"callback_url,omitempty"`
+
+	// 音视频直出相关
+	Audio     *bool  `json:"audio,omitempty"`
+	AudioType string `json:"audio_type,omitempty"`
+	VoiceID   string `json:"voice_id,omitempty"`
+
+	// 文生视频独有
+	Style string `json:"style,omitempty"`
+
+	// 错峰模式
+	OffPeak *bool `json:"off_peak,omitempty"`
+
+	// 水印
+	Watermark  *bool  `json:"watermark,omitempty"`
+	WmPosition *int   `json:"wm_position,omitempty"`
+	WmUrl      string `json:"wm_url,omitempty"`
+
+	// 元数据标识
+	MetaData string `json:"meta_data,omitempty"`
+
+	// 图生视频推荐提示词
+	IsRec *bool `json:"is_rec,omitempty"`
+
+	// 参考生视频（主体调用）
+	Subjects []subjectItem `json:"subjects,omitempty"`
+
+	// 参考生视频（非主体调用，viduq2-pro 视频参考）
+	Videos []string `json:"videos,omitempty"`
+
+	// 场景特效模板
+	Template string `json:"template,omitempty"`
+	Area     string `json:"area,omitempty"`
+	Beast    string `json:"beast,omitempty"`
+
+	// 智能多帧
+	StartImage    string             `json:"start_image,omitempty"`
+	ImageSettings []imageSettingItem `json:"image_settings,omitempty"`
 }
 
 type responsePayload struct {
 	TaskId            string   `json:"task_id"`
 	State             string   `json:"state"`
-	Model             string   `json:"model"`
-	Images            []string `json:"images"`
-	Prompt            string   `json:"prompt"`
-	Duration          int      `json:"duration"`
-	Seed              int      `json:"seed"`
-	Resolution        string   `json:"resolution"`
-	Bgm               bool     `json:"bgm"`
-	MovementAmplitude string   `json:"movement_amplitude"`
-	Payload           string   `json:"payload"`
+	Model             string   `json:"model,omitempty"`
+	Template          string   `json:"template,omitempty"`
+	Images            []string `json:"images,omitempty"`
+	Videos            []string `json:"videos,omitempty"`
+	Prompt            string   `json:"prompt,omitempty"`
+	Style             string   `json:"style,omitempty"`
+	Duration          int      `json:"duration,omitempty"`
+	Seed              int      `json:"seed,omitempty"`
+	Resolution        string   `json:"resolution,omitempty"`
+	AspectRatio       string   `json:"aspect_ratio,omitempty"`
+	Bgm               bool     `json:"bgm,omitempty"`
+	Audio             bool     `json:"audio,omitempty"`
+	AudioType         string   `json:"audio_type,omitempty"`
+	MovementAmplitude string   `json:"movement_amplitude,omitempty"`
+	Payload           string   `json:"payload,omitempty"`
+	OffPeak           bool     `json:"off_peak,omitempty"`
+	Credits           int      `json:"credits,omitempty"`
+	Watermark         bool     `json:"watermark,omitempty"`
 	CreatedAt         string   `json:"created_at"`
 }
 
@@ -144,6 +206,10 @@ func (a *TaskAdaptor) BuildRequestURL(info *relaycommon.RelayInfo) (string, erro
 		path = "/start-end2video"
 	case constant.TaskActionReferenceGenerate:
 		path = "/reference2video"
+	case constant.TaskActionMultiframe:
+		path = "/multiframe"
+	case constant.TaskActionTemplate:
+		path = "/template"
 	default:
 		path = "/text2video"
 	}
@@ -213,11 +279,54 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy 
 }
 
 func (a *TaskAdaptor) GetModelList() []string {
-	return []string{"viduq2", "viduq1", "vidu2.0", "vidu1.5"}
+	return []string{
+		"viduq3-pro",
+		"viduq3-turbo",
+		"viduq2-pro",
+		"viduq2-pro-fast",
+		"viduq2-turbo",
+		"viduq2",
+		"viduq1",
+		"viduq1-classic",
+		"vidu2.0",
+		"vidu1.5",
+	}
 }
 
 func (a *TaskAdaptor) GetChannelName() string {
 	return "vidu"
+}
+
+// viduCreditPriceRMB 是 Vidu 官方积分单价：1 积分 = 0.03125 元（RMB）
+const viduCreditPriceRMB = 0.03125
+
+// viduUSD2RMB 是 RMB 兑 USD 汇率（与项目内一致）
+const viduUSD2RMB = 7.0
+
+// AdjustBillingOnComplete 覆写 BaseBilling，根据上游返回的 credits 精确计费。
+// 返回实际 quota 值，由 settleTaskBillingOnComplete 做差额结算。
+func (a *TaskAdaptor) AdjustBillingOnComplete(task *model.Task, taskResult *relaycommon.TaskInfo) int {
+	if task == nil || task.Data == nil {
+		return 0
+	}
+
+	// 从 task.Data（存储的上游轮询响应体）中解析 credits
+	var result struct {
+		Credits int `json:"credits"`
+	}
+	if err := common.Unmarshal(task.Data, &result); err != nil || result.Credits <= 0 {
+		return 0
+	}
+
+	// credits → USD → quota
+	// quota = credits × 0.03125 (RMB/积分) ÷ 7.0 (RMB/USD) × 500000 (QuotaPerUnit)
+	costUSD := float64(result.Credits) * viduCreditPriceRMB / viduUSD2RMB
+	actualQuota := int(costUSD * common.QuotaPerUnit)
+
+	if actualQuota <= 0 {
+		actualQuota = 1 // 最低收费 1 quota
+	}
+	return actualQuota
 }
 
 // ============================
@@ -232,7 +341,6 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, in
 		Duration:          taskcommon.DefaultInt(req.Duration, 5),
 		Resolution:        taskcommon.DefaultString(req.Size, "1080p"),
 		MovementAmplitude: "auto",
-		Bgm:               false,
 	}
 	if err := taskcommon.UnmarshalMetadata(req.Metadata, &r); err != nil {
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
