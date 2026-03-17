@@ -452,7 +452,11 @@ func GetVoice(c *gin.Context) {
 	userVoices := model.GetUserVoicesFromDB(userId)
 	cloningInfos := make([]minimax.VoiceCloningInfo, 0)
 	generationInfos := make([]minimax.VoiceGenerationInfo, 0)
+
+	// 构建本地已有音色的 set，用于后续和上游对比
+	localVoiceSet := make(map[string]bool, len(userVoices))
 	for _, v := range userVoices {
+		localVoiceSet[v.VoiceId] = true
 		switch v.VoiceType {
 		case "cloning":
 			cloningInfos = append(cloningInfos, minimax.VoiceCloningInfo{
@@ -462,6 +466,39 @@ func GetVoice(c *gin.Context) {
 			generationInfos = append(generationInfos, minimax.VoiceGenerationInfo{
 				VoiceId: v.VoiceId,
 			})
+		}
+	}
+
+	// 从上游同步用户克隆音色：如果上游有而本地没有的，自动补录到数据库
+	chInfo, chErr := getMiniMaxChannelConfig(c)
+	if chErr == nil {
+		upstreamUserVoices, syncErr := fetchUserVoicesFromUpstream(chInfo, userId)
+		if syncErr == nil {
+			for _, uv := range upstreamUserVoices {
+				cleanVoiceId := stripVoiceIdPrefix(uv.VoiceId, userId)
+				if !localVoiceSet[cleanVoiceId] {
+					// 上游有但本地没有，补录到数据库
+					if saveErr := model.SaveUserVoice(userId, cleanVoiceId, uv.VoiceType, ""); saveErr != nil {
+						common.SysLog(fmt.Sprintf("[GetVoice] 补录用户音色失败: user=%d, voice=%s, err=%v", userId, cleanVoiceId, saveErr))
+					} else {
+						common.SysLog(fmt.Sprintf("[GetVoice] 补录用户音色成功: user=%d, voice=%s, type=%s", userId, cleanVoiceId, uv.VoiceType))
+						localVoiceSet[cleanVoiceId] = true
+						// 同时添加到返回列表
+						switch uv.VoiceType {
+						case "cloning":
+							cloningInfos = append(cloningInfos, minimax.VoiceCloningInfo{
+								VoiceId: cleanVoiceId,
+							})
+						case "generation":
+							generationInfos = append(generationInfos, minimax.VoiceGenerationInfo{
+								VoiceId: cleanVoiceId,
+							})
+						}
+					}
+				}
+			}
+		} else {
+			common.SysLog(fmt.Sprintf("[GetVoice] 从上游同步用户音色失败: user=%d, err=%v", userId, syncErr))
 		}
 	}
 
@@ -540,6 +577,75 @@ func syncSystemVoicesFromUpstream(chInfo *miniMaxChannelInfo) error {
 	return nil
 }
 
+// upstreamUserVoice 上游返回的用户音色信息（统一结构）
+type upstreamUserVoice struct {
+	VoiceId   string
+	VoiceType string // "cloning" 或 "generation"
+}
+
+// fetchUserVoicesFromUpstream 从上游 Minimax 获取属于指定用户的克隆/生成音色列表
+// 通过用户前缀（如 u4_）过滤出当前用户的音色
+func fetchUserVoicesFromUpstream(chInfo *miniMaxChannelInfo, userId int) ([]upstreamUserVoice, error) {
+	// 构造请求（查询所有类型的音色）
+	reqBody := minimax.GetVoiceRequest{VoiceType: "all"}
+	jsonData, err := common.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("序列化请求失败: %w", err)
+	}
+
+	upstreamUrl := fmt.Sprintf("%s/v1/get_voice", chInfo.BaseUrl)
+	httpReq, err := http.NewRequest("POST", upstreamUrl, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+chInfo.ApiKey)
+
+	client := service.GetHttpClient()
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("上游请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取上游响应失败: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("上游返回非 200: %d", resp.StatusCode)
+	}
+
+	var voiceResp minimax.GetVoiceResponse
+	if err := common.Unmarshal(respBody, &voiceResp); err != nil {
+		return nil, fmt.Errorf("解析上游响应失败: %w", err)
+	}
+
+	// 过滤出属于当前用户的音色（通过用户前缀判断）
+	var result []upstreamUserVoice
+	prefix := voiceIdPrefix(userId)
+
+	for _, v := range voiceResp.VoiceCloning {
+		if hasVoiceIdPrefix(v.VoiceId, userId) {
+			result = append(result, upstreamUserVoice{
+				VoiceId:   v.VoiceId,
+				VoiceType: "cloning",
+			})
+		}
+	}
+	for _, v := range voiceResp.VoiceGeneration {
+		if hasVoiceIdPrefix(v.VoiceId, userId) {
+			result = append(result, upstreamUserVoice{
+				VoiceId:   v.VoiceId,
+				VoiceType: "generation",
+			})
+		}
+	}
+
+	common.SysLog(fmt.Sprintf("[fetchUserVoicesFromUpstream] user=%d, prefix=%s, found=%d", userId, prefix, len(result)))
+	return result, nil
+}
 
 // DeleteVoice 处理 POST /v1/delete_voice
 // 删除音色，自动添加用户前缀确保只删除自己的
