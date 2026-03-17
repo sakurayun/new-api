@@ -39,10 +39,13 @@ type VoiceClonePrompt struct {
 }
 
 // VoiceCloneResponse 音色复刻响应
+// 注意：上游 Minimax 返回的 input_sensitive 字段可能是 bool(false) 或 object，
+// 使用 interface{} 兼容两种格式，避免 JSON 反序列化失败导致计费逻辑被跳过。
 type VoiceCloneResponse struct {
-	InputSensitive *InputSensitive `json:"input_sensitive,omitempty"`
-	DemoAudio      string          `json:"demo_audio,omitempty"`
-	BaseResp       MiniMaxBaseResp `json:"base_resp"`
+	InputSensitive     interface{}     `json:"input_sensitive,omitempty"`
+	InputSensitiveType int             `json:"input_sensitive_type,omitempty"`
+	DemoAudio          string          `json:"demo_audio,omitempty"`
+	BaseResp           MiniMaxBaseResp `json:"base_resp"`
 }
 
 // InputSensitive 输入音频风控检测结果

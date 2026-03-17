@@ -345,8 +345,12 @@ func VoiceClone(c *gin.Context) {
 	if resp.StatusCode == http.StatusOK {
 		if parseErr := common.Unmarshal(respBody, &cloneResp); parseErr == nil {
 			upstreamSuccess = cloneResp.BaseResp.StatusCode == 0
+		} else {
+			common.SysLog(fmt.Sprintf("[VoiceClone] 解析上游响应失败: %v, body=%s", parseErr, string(respBody[:min(len(respBody), 500)])))
 		}
 	}
+
+	common.SysLog(fmt.Sprintf("[VoiceClone] 计费判断: hasDemoAudio=%v, upstreamSuccess=%v, quota=%d, userId=%d", hasDemoAudio, upstreamSuccess, quota, userId))
 
 	// 如果试听成功，执行扣费和记录
 	if hasDemoAudio && upstreamSuccess && quota > 0 {
@@ -383,6 +387,7 @@ func VoiceClone(c *gin.Context) {
 			IsStream:         false,
 			Other:            other,
 		})
+		common.SysLog(fmt.Sprintf("[VoiceClone] 计费成功: userId=%d, model=%s, quota=%d, chars=%d", userId, req.Model, quota, textCharCount))
 	}
 
 	// 克隆成功后，将用户音色映射保存到数据库
