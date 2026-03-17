@@ -260,10 +260,16 @@ func VoiceClone(c *gin.Context) {
 
 	startTime := time.Now()
 
-	// 判断是否包含试听（text + model 都有值时触发 TTS 计费）
+	// ========== 计费预估 ==========
+	// 1. 克隆服务费（固定 ¥9.9）
+	//    QuotaPerUnit = 500000 = $1，USD2RMB = 7.3
+	//    ¥9.9 = 9.9 * 500000 / 7.3 ≈ 678082
+	cloneFixedQuota := int(9.9 * common.QuotaPerUnit / 7.3)
+
+	// 2. 试听 TTS 费用（按量，仅在 text + model 都有值时）
 	hasDemoAudio := req.Text != "" && req.Model != ""
 	textCharCount := 0
-	var quota int
+	var ttsQuota int
 
 	if hasDemoAudio {
 		textCharCount = utf8.RuneCountInString(req.Text)
@@ -275,33 +281,34 @@ func VoiceClone(c *gin.Context) {
 		if usePrice {
 			// 按价格计费
 			groupRatio := ratio_setting.GetGroupRatio("default")
-			quota = int(modelPrice * common.QuotaPerUnit * groupRatio)
+			ttsQuota = int(modelPrice * common.QuotaPerUnit * groupRatio)
 		} else {
 			// 按倍率计费：使用字符数作为 token 数
 			modelRatio, _, _ := ratio_setting.GetModelRatio(modelName)
 			groupRatio := ratio_setting.GetGroupRatio("default")
 			ratio := modelRatio * groupRatio
-			quota = int(float64(textCharCount) * ratio)
+			ttsQuota = int(float64(textCharCount) * ratio)
 		}
 
 		// 确保最低消耗 1（避免免费试听）
-		if quota <= 0 && textCharCount > 0 {
-			quota = 1
+		if ttsQuota <= 0 && textCharCount > 0 {
+			ttsQuota = 1
 		}
+	}
 
-		// 预扣费检查（确保用户余额充足）
-		if quota > 0 {
-			userQuota, err := model.GetUserQuota(userId, false)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "查询用户额度失败"})
-				return
-			}
-			if userQuota < quota {
-				c.JSON(http.StatusPaymentRequired, gin.H{
-					"error": fmt.Sprintf("用户额度不足，需要 %d，当前余额 %d", quota, userQuota),
-				})
-				return
-			}
+	// 预扣费检查（克隆固定费 + TTS 试听费）
+	totalQuota := cloneFixedQuota + ttsQuota
+	if totalQuota > 0 {
+		userQuota, err := model.GetUserQuota(userId, false)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "查询用户额度失败"})
+			return
+		}
+		if userQuota < totalQuota {
+			c.JSON(http.StatusPaymentRequired, gin.H{
+				"error": fmt.Sprintf("用户额度不足，需要 %d（克隆 %d + 试听 %d），当前余额 %d", totalQuota, cloneFixedQuota, ttsQuota, userQuota),
+			})
+			return
 		}
 	}
 
@@ -350,44 +357,72 @@ func VoiceClone(c *gin.Context) {
 		}
 	}
 
-	common.SysLog(fmt.Sprintf("[VoiceClone] 计费判断: hasDemoAudio=%v, upstreamSuccess=%v, quota=%d, userId=%d", hasDemoAudio, upstreamSuccess, quota, userId))
+	common.SysLog(fmt.Sprintf("[VoiceClone] 计费判断: upstreamSuccess=%v, cloneFixedQuota=%d, ttsQuota=%d, hasDemoAudio=%v, userId=%d", upstreamSuccess, cloneFixedQuota, ttsQuota, hasDemoAudio, userId))
 
-	// 如果试听成功，执行扣费和记录
-	if hasDemoAudio && upstreamSuccess && quota > 0 {
+	// ========== 扣费和日志记录 ==========
+	if upstreamSuccess {
 		useTimeSeconds := int(time.Now().Unix() - startTime.Unix())
 		tokenName := c.GetString("token_name")
 		tokenId := c.GetInt("token_id")
 
-		// 扣减用户额度和增加请求计数
-		model.UpdateUserUsedQuotaAndRequestCount(userId, quota)
-		model.UpdateChannelUsedQuota(chInfo.ChannelId, quota)
+		// 1. 克隆固定费用 ¥9.9
+		if cloneFixedQuota > 0 {
+			model.UpdateUserUsedQuotaAndRequestCount(userId, cloneFixedQuota)
+			model.UpdateChannelUsedQuota(chInfo.ChannelId, cloneFixedQuota)
 
-		// 记录消费日志
-		modelRatio, _, _ := ratio_setting.GetModelRatio(req.Model)
-		groupRatio := ratio_setting.GetGroupRatio("default")
-		other := map[string]interface{}{
-			"model_ratio":   modelRatio,
-			"group_ratio":   groupRatio,
-			"voice_clone":   true,
-			"text_chars":    textCharCount,
-			"quota_formula": fmt.Sprintf("chars(%d) * model_ratio(%.4f) * group_ratio(%.4f)", textCharCount, modelRatio, groupRatio),
+			cloneOther := map[string]interface{}{
+				"voice_clone":    true,
+				"fixed_fee_rmb":  9.9,
+				"quota_formula":  "固定费用 ¥9.9",
+			}
+			model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
+				ChannelId:        chInfo.ChannelId,
+				PromptTokens:     0,
+				CompletionTokens: 0,
+				ModelName:        "voice-clone",
+				TokenName:        tokenName,
+				Quota:            cloneFixedQuota,
+				Content:          fmt.Sprintf("音色复刻服务费 ¥9.9，voice_id=%s", stripVoiceIdPrefix(req.VoiceId, userId)),
+				TokenId:          tokenId,
+				UseTimeSeconds:   useTimeSeconds,
+				IsStream:         false,
+				Other:            cloneOther,
+			})
+			common.SysLog(fmt.Sprintf("[VoiceClone] 克隆固定扣费成功: userId=%d, quota=%d (¥9.9)", userId, cloneFixedQuota))
 		}
 
-		dQuota := decimal.NewFromInt(int64(quota))
-		model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
-			ChannelId:        chInfo.ChannelId,
-			PromptTokens:     textCharCount, // 以字符数作为 prompt tokens 记录
-			CompletionTokens: 0,
-			ModelName:        req.Model,
-			TokenName:        tokenName,
-			Quota:            int(dQuota.IntPart()),
-			Content:          fmt.Sprintf("音色复刻试听，文本字符数 %d", textCharCount),
-			TokenId:          tokenId,
-			UseTimeSeconds:   useTimeSeconds,
-			IsStream:         false,
-			Other:            other,
-		})
-		common.SysLog(fmt.Sprintf("[VoiceClone] 计费成功: userId=%d, model=%s, quota=%d, chars=%d", userId, req.Model, quota, textCharCount))
+		// 2. TTS 试听按量费用（仅在有试听文本时）
+		if hasDemoAudio && ttsQuota > 0 {
+			model.UpdateUserUsedQuotaAndRequestCount(userId, ttsQuota)
+			model.UpdateChannelUsedQuota(chInfo.ChannelId, ttsQuota)
+
+			modelRatio, _, _ := ratio_setting.GetModelRatio(req.Model)
+			groupRatio := ratio_setting.GetGroupRatio("default")
+			ttsOther := map[string]interface{}{
+				"model_ratio":   modelRatio,
+				"group_ratio":   groupRatio,
+				"voice_clone":   true,
+				"demo_audio":    true,
+				"text_chars":    textCharCount,
+				"quota_formula": fmt.Sprintf("chars(%d) * model_ratio(%.4f) * group_ratio(%.4f)", textCharCount, modelRatio, groupRatio),
+			}
+
+			dQuota := decimal.NewFromInt(int64(ttsQuota))
+			model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
+				ChannelId:        chInfo.ChannelId,
+				PromptTokens:     textCharCount,
+				CompletionTokens: 0,
+				ModelName:        req.Model,
+				TokenName:        tokenName,
+				Quota:            int(dQuota.IntPart()),
+				Content:          fmt.Sprintf("音色复刻试听，文本字符数 %d", textCharCount),
+				TokenId:          tokenId,
+				UseTimeSeconds:   useTimeSeconds,
+				IsStream:         false,
+				Other:            ttsOther,
+			})
+			common.SysLog(fmt.Sprintf("[VoiceClone] TTS 试听扣费成功: userId=%d, model=%s, quota=%d, chars=%d", userId, req.Model, ttsQuota, textCharCount))
+		}
 	}
 
 	// 克隆成功后，将用户音色映射保存到数据库
