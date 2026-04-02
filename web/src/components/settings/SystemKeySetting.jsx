@@ -317,6 +317,7 @@ function SystemKeySetting() {
                             showClear
                             style={{ width: 180 }}
                             optionList={[
+                                { label: '创建用户并绑定OIDC', value: 'create_user_oidc' },
                                 { label: '查询用户信息', value: 'get_user_info' },
                                 { label: '查询用户令牌', value: 'get_user_tokens' },
                                 { label: '查询可用模型', value: 'get_user_models' },
