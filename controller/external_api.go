@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -319,5 +320,164 @@ func ExtDeleteToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
+	})
+}
+
+// ExtCreateUserWithOIDCRequest 创建用户并绑定 OIDC 的请求体
+type ExtCreateUserWithOIDCRequest struct {
+	Username    string `json:"username" binding:"required"`
+	DisplayName string `json:"display_name"`
+	Password    string `json:"password"`
+	OpenId      string `json:"open_id" binding:"required"`
+	ProviderId  int    `json:"provider_id" binding:"required"`
+}
+
+// ExtCreateUserWithOIDC 创建用户并预绑定 OIDC
+// 若 open_id + provider_id 已绑定到现有用户，返回该用户信息（幂等）。
+// 若未绑定但 username 已存在，为已有用户补绑 OIDC。
+// 若两者都不存在，创建新用户并绑定 OIDC。
+func ExtCreateUserWithOIDC(c *gin.Context) {
+	var req ExtCreateUserWithOIDCRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		logExternalAction(c, "create_user_oidc", "", 0, 400, "请求参数错误: "+err.Error())
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "请求参数错误: " + err.Error(),
+		})
+		return
+	}
+
+	if len(req.Username) > model.UserNameMaxLength {
+		logExternalAction(c, "create_user_oidc", req.OpenId, 0, 400, "用户名过长")
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": fmt.Sprintf("用户名不能超过 %d 个字符", model.UserNameMaxLength),
+		})
+		return
+	}
+
+	// 验证 provider_id 对应的 OAuth Provider 是否存在
+	_, err := model.GetCustomOAuthProviderById(req.ProviderId)
+	if err != nil {
+		logExternalAction(c, "create_user_oidc", req.OpenId, 0, 400, "无效的 provider_id")
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "指定的 OAuth Provider 不存在",
+		})
+		return
+	}
+
+	// 1. 检查 OIDC 绑定是否已存在（幂等：同一 open_id + provider_id 直接返回已有用户）
+	existingUser, err := model.GetUserByOAuthBinding(req.ProviderId, req.OpenId)
+	if err == nil && existingUser != nil {
+		logExternalAction(c, "create_user_oidc", req.OpenId, existingUser.Id, 200, "用户已存在（幂等返回）")
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "用户已存在",
+			"data": gin.H{
+				"user_id":      existingUser.Id,
+				"username":     existingUser.Username,
+				"display_name": existingUser.DisplayName,
+				"created":      false,
+			},
+		})
+		return
+	}
+
+	// 2. 检查 username 是否已存在
+	var targetUser *model.User
+	exist, _ := model.CheckUserExistOrDeleted(req.Username, "")
+	if exist {
+		// 用户名已存在，尝试为其补绑 OIDC
+		var u model.User
+		if err := model.DB.Where("username = ?", req.Username).First(&u).Error; err != nil {
+			logExternalAction(c, "create_user_oidc", req.OpenId, 0, 500, "查询已有用户失败: "+err.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"message": "查询用户失败",
+			})
+			return
+		}
+		targetUser = &u
+	} else {
+		// 3. 创建新用户
+		displayName := req.DisplayName
+		if displayName == "" {
+			displayName = req.Username
+		}
+		password := req.Password
+		if password == "" {
+			password = common.GetRandomString(16)
+		}
+
+		newUser := model.User{
+			Username:    req.Username,
+			Password:    password,
+			DisplayName: displayName,
+			Role:        common.RoleCommonUser,
+		}
+		if err := newUser.Insert(0); err != nil {
+			logExternalAction(c, "create_user_oidc", req.OpenId, 0, 500, "创建用户失败: "+err.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"message": "创建用户失败: " + err.Error(),
+			})
+			return
+		}
+
+		// 重新查询以获取完整的用户信息（含自增 ID）
+		var created model.User
+		if err := model.DB.Where("username = ?", req.Username).First(&created).Error; err != nil {
+			logExternalAction(c, "create_user_oidc", req.OpenId, 0, 500, "查询新建用户失败")
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"success": false,
+				"message": "创建用户后查询失败",
+			})
+			return
+		}
+		targetUser = &created
+
+		// 自动生成默认令牌
+		if constant.GenerateDefaultToken {
+			key, err := common.GenerateKey()
+			if err == nil {
+				token := model.Token{
+					UserId:         targetUser.Id,
+					Name:           targetUser.Username + "的初始令牌",
+					Key:            key,
+					CreatedTime:    common.GetTimestamp(),
+					AccessedTime:   common.GetTimestamp(),
+					ExpiredTime:    -1,
+					UnlimitedQuota: true,
+				}
+				_ = token.Insert()
+			}
+		}
+	}
+
+	// 4. 创建 OIDC 绑定
+	binding := &model.UserOAuthBinding{
+		UserId:         targetUser.Id,
+		ProviderId:     req.ProviderId,
+		ProviderUserId: req.OpenId,
+	}
+	if err := model.CreateUserOAuthBinding(binding); err != nil {
+		// 如果绑定已存在（并发竞争），不视为错误
+		logExternalAction(c, "create_user_oidc", req.OpenId, targetUser.Id, 200,
+			"用户已创建，OIDC 绑定可能已存在: "+err.Error())
+	} else {
+		logExternalAction(c, "create_user_oidc", req.OpenId, targetUser.Id, 200, "创建用户并绑定 OIDC 成功")
+	}
+
+	wasCreated := !exist
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "",
+		"data": gin.H{
+			"user_id":      targetUser.Id,
+			"username":     targetUser.Username,
+			"display_name": targetUser.DisplayName,
+			"created":      wasCreated,
+		},
 	})
 }

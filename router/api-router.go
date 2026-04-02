@@ -393,6 +393,7 @@ func SetApiRouter(router *gin.Engine) {
 		externalRoute := apiRouter.Group("/external")
 		externalRoute.Use(middleware.SystemKeyAuth())
 		{
+			externalRoute.POST("/user", controller.ExtCreateUserWithOIDC)
 			externalRoute.GET("/user", controller.ExtGetUserInfo)
 			externalRoute.GET("/user/tokens", controller.ExtGetUserTokens)
 			externalRoute.GET("/user/models", controller.ExtGetUserModels)
