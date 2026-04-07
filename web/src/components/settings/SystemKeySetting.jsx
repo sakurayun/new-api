@@ -250,16 +250,20 @@ function SystemKeySetting() {
         {
             title: '操作',
             dataIndex: 'action',
-            width: 120,
+            width: 140,
             render: (action) => {
-                const colorMap = {
-                    get_user_info: 'blue',
-                    get_user_tokens: 'cyan',
-                    get_user_models: 'teal',
-                    create_token: 'green',
-                    delete_token: 'red',
+                const actionConfig = {
+                    create_user_oidc: { color: 'purple', label: '创建用户/绑定OIDC' },
+                    get_user_info:    { color: 'blue',   label: '查询用户信息' },
+                    get_user_tokens:  { color: 'cyan',   label: '查询用户令牌' },
+                    get_user_models:  { color: 'teal',   label: '查询可用模型' },
+                    get_user_logs:    { color: 'indigo',  label: '查询使用日志' },
+                    get_user_tasks:   { color: 'amber',  label: '查询任务日志' },
+                    create_token:     { color: 'green',  label: '创建令牌' },
+                    delete_token:     { color: 'red',    label: '删除令牌' },
                 };
-                return <Tag color={colorMap[action] || 'grey'} size="small">{action}</Tag>;
+                const cfg = actionConfig[action];
+                return <Tag color={cfg?.color || 'grey'} size="small">{cfg?.label || action}</Tag>;
             },
         },
         { title: '目标 OpenID', dataIndex: 'target_open_id', width: 180 },
@@ -317,10 +321,12 @@ function SystemKeySetting() {
                             showClear
                             style={{ width: 180 }}
                             optionList={[
-                                { label: '创建用户并绑定OIDC', value: 'create_user_oidc' },
+                                { label: '创建用户/绑定OIDC', value: 'create_user_oidc' },
                                 { label: '查询用户信息', value: 'get_user_info' },
                                 { label: '查询用户令牌', value: 'get_user_tokens' },
                                 { label: '查询可用模型', value: 'get_user_models' },
+                                { label: '查询使用日志', value: 'get_user_logs' },
+                                { label: '查询任务日志', value: 'get_user_tasks' },
                                 { label: '创建令牌', value: 'create_token' },
                                 { label: '删除令牌', value: 'delete_token' },
                             ]}

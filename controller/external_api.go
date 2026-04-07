@@ -7,7 +7,9 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -62,7 +64,7 @@ func logExternalAction(c *gin.Context, action string, openId string, userId int,
 	)
 }
 
-// ExtGetUserInfo 根据 OpenID 查询用户基本信息和余额
+// ExtGetUserInfo 根据 OpenID 查询用户基本信息、余额、使用统计和资源消耗
 func ExtGetUserInfo(c *gin.Context) {
 	user, openId, _, ok := resolveUserByOpenId(c)
 	if !ok {
@@ -79,20 +81,69 @@ func ExtGetUserInfo(c *gin.Context) {
 
 	usedQuota, _ := model.GetUserUsedQuota(user.Id)
 
+	// 查询使用统计（RPM、TPM）
+	stat, _ := model.SumUsedQuota(model.LogTypeConsume, 0, 0, "", user.Username, "", 0, "")
+
+	// 查询请求总数
+	requestCount := user.RequestCount
+
+	// 查询资源消耗明细（最近 30 天按模型聚合）
+	now := common.GetTimestamp()
+	thirtyDaysAgo := now - 30*24*3600
+	quotaDataList, _ := model.GetQuotaDataByUserId(user.Id, thirtyDaysAgo, now)
+
+	// 按模型聚合资源消耗
+	type ModelConsumption struct {
+		ModelName  string `json:"model_name"`
+		Count      int    `json:"count"`
+		Quota      int    `json:"quota"`
+		TokenUsed  int    `json:"token_used"`
+	}
+	modelMap := make(map[string]*ModelConsumption)
+	for _, qd := range quotaDataList {
+		if mc, exists := modelMap[qd.ModelName]; exists {
+			mc.Count += qd.Count
+			mc.Quota += qd.Quota
+			mc.TokenUsed += qd.TokenUsed
+		} else {
+			modelMap[qd.ModelName] = &ModelConsumption{
+				ModelName:  qd.ModelName,
+				Count:      qd.Count,
+				Quota:      qd.Quota,
+				TokenUsed:  qd.TokenUsed,
+			}
+		}
+	}
+	var modelConsumptions []ModelConsumption
+	for _, mc := range modelMap {
+		modelConsumptions = append(modelConsumptions, *mc)
+	}
+
 	logExternalAction(c, "get_user_info", openId, user.Id, 200, "成功")
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"user_id":      user.Id,
-			"username":     user.Username,
-			"display_name": user.DisplayName,
-			"email":        user.Email,
-			"status":       user.Status,
-			"quota":        quota,
-			"used_quota":   usedQuota,
-			"group":        user.Group,
+			"user_id":       user.Id,
+			"username":      user.Username,
+			"display_name":  user.DisplayName,
+			"email":         user.Email,
+			"status":        user.Status,
+			"quota":         quota,
+			"used_quota":    usedQuota,
+			"group":         user.Group,
+			"request_count": requestCount,
+			"usage_stats": gin.H{
+				"total_consumed_quota": stat.Quota,
+				"rpm":                 stat.Rpm,
+				"tpm":                 stat.Tpm,
+			},
+			"resource_consumption": gin.H{
+				"period_start": thirtyDaysAgo,
+				"period_end":   now,
+				"by_model":     modelConsumptions,
+			},
 		},
 	})
 }
@@ -321,6 +372,74 @@ func ExtDeleteToken(c *gin.Context) {
 		"success": true,
 		"message": "",
 	})
+}
+
+// ExtGetUserLogs 根据 OpenID 查询用户使用日志
+func ExtGetUserLogs(c *gin.Context) {
+	user, openId, _, ok := resolveUserByOpenId(c)
+	if !ok {
+		logExternalAction(c, "get_user_logs", openId, 0, 404, "未找到用户")
+		return
+	}
+
+	pageInfo := common.GetPageQuery(c)
+	logType, _ := strconv.Atoi(c.Query("type"))
+	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
+	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
+	tokenName := c.Query("token_name")
+	modelName := c.Query("model_name")
+	group := c.Query("group")
+	requestId := c.Query("request_id")
+
+	logs, total, err := model.GetUserLogs(user.Id, logType, startTimestamp, endTimestamp, modelName, tokenName, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), group, requestId)
+	if err != nil {
+		logExternalAction(c, "get_user_logs", openId, user.Id, 500, "查询日志失败")
+		common.ApiError(c, err)
+		return
+	}
+
+	logExternalAction(c, "get_user_logs", openId, user.Id, 200, fmt.Sprintf("返回 %d 条日志", len(logs)))
+
+	pageInfo.SetTotal(int(total))
+	pageInfo.SetItems(logs)
+	common.ApiSuccess(c, pageInfo)
+}
+
+// ExtGetUserTasks 根据 OpenID 查询用户任务日志
+func ExtGetUserTasks(c *gin.Context) {
+	user, openId, _, ok := resolveUserByOpenId(c)
+	if !ok {
+		logExternalAction(c, "get_user_tasks", openId, 0, 404, "未找到用户")
+		return
+	}
+
+	pageInfo := common.GetPageQuery(c)
+	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
+	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
+
+	queryParams := model.SyncTaskQueryParams{
+		Platform:       constant.TaskPlatform(c.Query("platform")),
+		TaskID:         c.Query("task_id"),
+		Status:         c.Query("status"),
+		Action:         c.Query("action"),
+		StartTimestamp: startTimestamp,
+		EndTimestamp:   endTimestamp,
+	}
+
+	items := model.TaskGetAllUserTask(user.Id, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
+	total := model.TaskCountAllUserTask(user.Id, queryParams)
+
+	// 转换为 DTO，不填充用户名（外部 API 已知用户身份）
+	taskDtos := make([]*dto.TaskDto, len(items))
+	for i, task := range items {
+		taskDtos[i] = relay.TaskModel2Dto(task)
+	}
+
+	logExternalAction(c, "get_user_tasks", openId, user.Id, 200, fmt.Sprintf("返回 %d 个任务", len(taskDtos)))
+
+	pageInfo.SetTotal(int(total))
+	pageInfo.SetItems(taskDtos)
+	common.ApiSuccess(c, pageInfo)
 }
 
 // ExtCreateUserWithOIDCRequest 创建用户并绑定 OIDC 的请求体

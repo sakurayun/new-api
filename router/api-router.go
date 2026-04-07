@@ -397,6 +397,8 @@ func SetApiRouter(router *gin.Engine) {
 			externalRoute.GET("/user", controller.ExtGetUserInfo)
 			externalRoute.GET("/user/tokens", controller.ExtGetUserTokens)
 			externalRoute.GET("/user/models", controller.ExtGetUserModels)
+			externalRoute.GET("/user/logs", controller.ExtGetUserLogs)
+			externalRoute.GET("/user/tasks", controller.ExtGetUserTasks)
 			externalRoute.POST("/user/tokens", controller.ExtCreateToken)
 			externalRoute.DELETE("/user/tokens/:token_id", controller.ExtDeleteToken)
 		}
