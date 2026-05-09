@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -87,11 +89,39 @@ func rateLimitFactory(maxRequestNum int, duration int64, mark string) func(c *gi
 	}
 }
 
-func GlobalWebRateLimit() func(c *gin.Context) {
-	if common.GlobalWebRateLimitEnable {
-		return rateLimitFactory(common.GlobalWebRateLimitNum, common.GlobalWebRateLimitDuration, "GW")
+var staticAssetExtensions = map[string]struct{}{
+	".js": {}, ".mjs": {}, ".cjs": {}, ".css": {}, ".map": {},
+	".png": {}, ".jpg": {}, ".jpeg": {}, ".gif": {}, ".webp": {}, ".avif": {}, ".ico": {}, ".svg": {},
+	".woff": {}, ".woff2": {}, ".ttf": {}, ".otf": {}, ".eot": {},
+	".json": {}, ".webmanifest": {}, ".txt": {}, ".wasm": {},
+}
+
+var staticAssetPrefixes = []string{"/assets/", "/static/", "/locales/", "/fonts/", "/images/", "/img/"}
+
+func isStaticAssetPath(p string) bool {
+	for _, prefix := range staticAssetPrefixes {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
 	}
-	return defNext
+	if _, ok := staticAssetExtensions[strings.ToLower(path.Ext(p))]; ok {
+		return true
+	}
+	return false
+}
+
+func GlobalWebRateLimit() func(c *gin.Context) {
+	if !common.GlobalWebRateLimitEnable {
+		return defNext
+	}
+	limit := rateLimitFactory(common.GlobalWebRateLimitNum, common.GlobalWebRateLimitDuration, "GW")
+	return func(c *gin.Context) {
+		if isStaticAssetPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		limit(c)
+	}
 }
 
 func GlobalAPIRateLimit() func(c *gin.Context) {
