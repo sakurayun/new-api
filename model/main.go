@@ -283,6 +283,7 @@ func migrateDB() error {
 		&SystemKey{},
 		&SystemKeyLog{},
 		&MiniMaxVoice{},
+		&PerfMetric{},
 	)
 	if err != nil {
 		return err
@@ -334,6 +335,7 @@ func migrateDBFast() error {
 		{&SystemKey{}, "SystemKey"},
 		{&SystemKeyLog{}, "SystemKeyLog"},
 		{&MiniMaxVoice{}, "MiniMaxVoice"},
+		{&PerfMetric{}, "PerfMetric"},
 	}
 	// 动态计算migration数量，确保errChan缓冲区足够大
 	errChan := make(chan error, len(migrations))
