@@ -77,7 +77,10 @@ func LogInfo(ctx context.Context, msg string) {
 	logHelper(ctx, loggerINFO, msg)
 }
 
-func LogWarn(ctx context.Context, msg string) {
+func LogWarn(ctx context.Context, msg string, args ...any) {
+	if len(args) > 0 {
+		msg = fmt.Sprintf(msg, args...)
+	}
 	logHelper(ctx, loggerWarn, msg)
 }
 
@@ -95,9 +98,11 @@ func LogDebug(ctx context.Context, msg string, args ...any) {
 }
 
 func logHelper(ctx context.Context, level string, msg string) {
-	id := ctx.Value(common.RequestIdKey)
-	if id == nil {
-		id = "SYSTEM"
+	var id any = "SYSTEM"
+	if ctx != nil {
+		if requestID := ctx.Value(common.RequestIdKey); requestID != nil {
+			id = requestID
+		}
 	}
 	now := time.Now()
 	common.LogWriterMu.RLock()
@@ -172,10 +177,13 @@ func FormatQuota(quota int) string {
 
 // LogJson 仅供测试使用 only for test
 func LogJson(ctx context.Context, msg string, obj any) {
+	if !common.DebugEnabled {
+		return
+	}
 	jsonStr, err := common.Marshal(obj)
 	if err != nil {
 		LogError(ctx, fmt.Sprintf("json marshal failed: %s", err.Error()))
 		return
 	}
-	LogDebug(ctx, fmt.Sprintf("%s | %s", msg, string(jsonStr)))
+	LogDebug(ctx, "%s | %s", msg, jsonStr)
 }

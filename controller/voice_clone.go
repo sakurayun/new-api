@@ -370,11 +370,12 @@ func VoiceClone(c *gin.Context) {
 			model.UpdateUserUsedQuotaAndRequestCount(userId, cloneFixedQuota)
 			model.UpdateChannelUsedQuota(chInfo.ChannelId, cloneFixedQuota)
 
-			cloneOther := map[string]interface{}{
-				"voice_clone":    true,
-				"fixed_fee_rmb":  9.9,
-				"quota_formula":  "固定费用 ¥9.9",
-			}
+			cloneOther := model.NewLogOther()
+			cloneOther.MergePublic(map[string]any{
+				"voice_clone":   true,
+				"fixed_fee_rmb": 9.9,
+				"quota_formula": "固定费用 ¥9.9",
+			})
 			model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
 				ChannelId:        chInfo.ChannelId,
 				PromptTokens:     0,
@@ -398,14 +399,15 @@ func VoiceClone(c *gin.Context) {
 
 			modelRatio, _, _ := ratio_setting.GetModelRatio(req.Model)
 			groupRatio := ratio_setting.GetGroupRatio("default")
-			ttsOther := map[string]interface{}{
+			ttsOther := model.NewLogOther()
+			ttsOther.MergePublic(map[string]any{
 				"model_ratio":   modelRatio,
 				"group_ratio":   groupRatio,
 				"voice_clone":   true,
 				"demo_audio":    true,
 				"text_chars":    textCharCount,
 				"quota_formula": fmt.Sprintf("chars(%d) * model_ratio(%.4f) * group_ratio(%.4f)", textCharCount, modelRatio, groupRatio),
-			}
+			})
 
 			dQuota := decimal.NewFromInt(int64(ttsQuota))
 			model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
@@ -435,7 +437,6 @@ func VoiceClone(c *gin.Context) {
 
 	c.Data(resp.StatusCode, "application/json", respBody)
 }
-
 
 // GetVoice 处理 POST /v1/get_voice
 // 从数据库读取系统音色列表 + 当前用户的克隆音色列表
@@ -853,10 +854,10 @@ func T2AAsync(c *gin.Context) {
 	// 如果上游返回成功，解析 usage_characters 做计费
 	if resp.StatusCode == http.StatusOK && modelName != "" {
 		var asyncResp struct {
-			TaskId          string          `json:"task_id"`
-			FileId          int64           `json:"file_id"`
-			TaskToken       string          `json:"task_token"`
-			UsageCharacters int             `json:"usage_characters"`
+			TaskId          string `json:"task_id"`
+			FileId          int64  `json:"file_id"`
+			TaskToken       string `json:"task_token"`
+			UsageCharacters int    `json:"usage_characters"`
 			BaseResp        struct {
 				StatusCode int    `json:"status_code"`
 				StatusMsg  string `json:"status_msg"`
@@ -880,12 +881,13 @@ func T2AAsync(c *gin.Context) {
 					model.UpdateChannelUsedQuota(chInfo.ChannelId, quota)
 
 					// 记录消费日志
-					other := map[string]interface{}{
+					other := model.NewLogOther()
+					other.MergePublic(map[string]any{
 						"model_ratio":      modelRatio,
 						"group_ratio":      groupRatio,
 						"async_tts":        true,
 						"usage_characters": usageChars,
-					}
+					})
 
 					model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
 						ChannelId:        chInfo.ChannelId,
@@ -1160,12 +1162,13 @@ func t2aSyncDoBilling(c *gin.Context, chInfo *miniMaxChannelInfo, modelName stri
 	model.UpdateChannelUsedQuota(chInfo.ChannelId, quota)
 
 	// 记录消费日志
-	other := map[string]interface{}{
+	other := model.NewLogOther()
+	other.MergePublic(map[string]any{
 		"model_ratio":      modelRatio,
 		"group_ratio":      groupRatio,
 		"sync_tts":         true,
 		"usage_characters": usageChars,
-	}
+	})
 
 	streamLabel := "同步"
 	if isStream {

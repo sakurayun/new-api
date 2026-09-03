@@ -94,10 +94,10 @@ func ExtGetUserInfo(c *gin.Context) {
 
 	// 按模型聚合资源消耗
 	type ModelConsumption struct {
-		ModelName  string `json:"model_name"`
-		Count      int    `json:"count"`
-		Quota      int    `json:"quota"`
-		TokenUsed  int    `json:"token_used"`
+		ModelName string `json:"model_name"`
+		Count     int    `json:"count"`
+		Quota     int    `json:"quota"`
+		TokenUsed int    `json:"token_used"`
 	}
 	modelMap := make(map[string]*ModelConsumption)
 	for _, qd := range quotaDataList {
@@ -107,10 +107,10 @@ func ExtGetUserInfo(c *gin.Context) {
 			mc.TokenUsed += qd.TokenUsed
 		} else {
 			modelMap[qd.ModelName] = &ModelConsumption{
-				ModelName:  qd.ModelName,
-				Count:      qd.Count,
-				Quota:      qd.Quota,
-				TokenUsed:  qd.TokenUsed,
+				ModelName: qd.ModelName,
+				Count:     qd.Count,
+				Quota:     qd.Quota,
+				TokenUsed: qd.TokenUsed,
 			}
 		}
 	}
@@ -136,8 +136,8 @@ func ExtGetUserInfo(c *gin.Context) {
 			"request_count": requestCount,
 			"usage_stats": gin.H{
 				"total_consumed_quota": stat.Quota,
-				"rpm":                 stat.Rpm,
-				"tpm":                 stat.Tpm,
+				"rpm":                  stat.Rpm,
+				"tpm":                  stat.Tpm,
 			},
 			"resource_consumption": gin.H{
 				"period_start": thirtyDaysAgo,
@@ -390,8 +390,9 @@ func ExtGetUserLogs(c *gin.Context) {
 	modelName := c.Query("model_name")
 	group := c.Query("group")
 	requestId := c.Query("request_id")
+	upstreamRequestId := c.Query("upstream_request_id")
 
-	logs, total, err := model.GetUserLogs(user.Id, logType, startTimestamp, endTimestamp, modelName, tokenName, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), group, requestId)
+	logs, total, err := model.GetUserLogs(user.Id, logType, startTimestamp, endTimestamp, modelName, tokenName, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), group, requestId, upstreamRequestId)
 	if err != nil {
 		logExternalAction(c, "get_user_logs", openId, user.Id, 500, "查询日志失败")
 		common.ApiError(c, err)
